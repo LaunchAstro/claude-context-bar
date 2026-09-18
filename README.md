@@ -1,6 +1,7 @@
-# Astro Context Bar
+# Claude Context Bar
 
 A dependency-free status line for [Claude Code](https://claude.com/claude-code).
+An unaffiliated community project — not made by or endorsed by Anthropic.
 One line, at the bottom of every pane, showing what the session is actually
 costing you:
 
@@ -30,13 +31,17 @@ Node 18 or newer. Nothing else — no packages, no install step, no network.
 
 ## Install
 
+```sh
+git clone https://github.com/LaunchAstro/claude-context-bar.git
+```
+
 Put `claude-statusline.js` anywhere you like and point Claude Code at it in
 `~/.claude/settings.json`:
 
 ```json
 "statusLine": {
   "type": "command",
-  "command": "node /path/to/astro-context-bar/claude-statusline.js"
+  "command": "node /path/to/claude-context-bar/claude-statusline.js"
 }
 ```
 
