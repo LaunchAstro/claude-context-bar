@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
 // A dependency-free status line for Claude Code.
-// Shows the active model, working directory, usable context consumed,
-// the token count behind that bar, session cost, and quota burn.
+// Shows the active model and its context cap, the working directory, the
+// usable context consumed, session cost, and quota burn.
 //
-// Segments:  MODEL │ DIR │ [bar] USED% · TOKENS │ $COST │ SEAT · 5h N% exp T · 7d N% exp T
+// Segments:  MODEL (CAP) │ DIR │ [bar] USED% │ $COST │ SEAT · 5h N% exp T · 7d N% exp T
 //
 // Note on the numbers: the token count is what is sitting in the context
 // window right now (it falls after a compaction). The dollar figure is
 // cumulative for the whole session and only ever climbs. Two different
-// things — do not add them up.
+// things, so do not add them up.
 //
 // Everything above `main()` is pure: hand `fit()` a payload and it returns the
 // line. The process only touches stdin, the clock and the disk at the edges,
@@ -24,15 +24,15 @@ const OFF = '\x1b[0m';
 const paint = (colour, text) => `${colour}${text}${OFF}`;
 const dim = (text) => paint(DIM, text);
 
-// A narrow pane cannot hold the whole line, so detail is given up in this order
-// — least useful first. The quota figures and the seat are what the bar is for,
-// so they are never dropped.
-const TRIMS = ['tokens', 'bar', 'cost', 'directory', 'model', 'expiry'];
+// A narrow pane cannot hold the whole line, so detail is given up in this
+// order, least useful first. The quota figures and the seat are what the bar
+// is for, so they are never dropped.
+const TRIMS = ['cap', 'bar', 'cost', 'directory', 'model', 'expiry'];
 const DROP_NOTHING = new Set();
 
 const width = (line) => line.replace(/\x1b\[[0-9;]*m/g, '').length;
 
-// Green under half, amber, orange, then red — same ramp everywhere. Flashing is
+// Green under half, amber, orange, then red. Same ramp everywhere. Flashing is
 // reserved for the context bar, where running out ends the turn you are in.
 function ramp(pct, { flash = false } = {}) {
   if (pct < 50) return '\x1b[32m';
@@ -47,17 +47,6 @@ function compact(n) {
   }
   if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
   return String(n);
-}
-
-// Tokens sitting in the window. Newer payloads state it outright; older ones
-// only carry the parts, and cached reads count just as much as fresh input.
-function heldTokens(cw) {
-  if (cw.total_input_tokens != null) return cw.total_input_tokens;
-  const usage = cw.current_usage;
-  if (!usage) return null;
-  return (usage.input_tokens || 0)
-    + (usage.cache_read_input_tokens || 0)
-    + (usage.cache_creation_input_tokens || 0);
 }
 
 // How long a window has left, from its Unix reset stamp. Always rounded DOWN, so
@@ -99,16 +88,14 @@ function contextSegment(cw, { env = process.env, drop = DROP_NOTHING } = {}) {
   // still flashes red in a pane too narrow to draw the bar.
   const bar = drop.has('bar') ? '' : `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} `;
 
-  const held = drop.has('tokens') ? null : heldTokens(cw);
-  const tokens = held == null ? '' : ` ${dim(`${compact(held)}/${compact(totalTokens)}`)}`;
-  return `${paint(ramp(used, { flash: true }), `${bar}${used}%`)}${tokens}`;
+  return paint(ramp(used, { flash: true }), `${bar}${used}%`);
 }
 
 function costSegment(cost) {
   return typeof cost === 'number' ? dim(`$${cost.toFixed(2)}`) : null;
 }
 
-// Quota burn — the numbers that actually decide whether the fleet keeps running.
+// Quota burn: the numbers that actually decide whether the fleet keeps running.
 // The seat leads, because it says whose quota these are, and it stands alone on
 // a session that has no subscription windows at all.
 function quotaSegment(rateLimits, { now, seat, drop = DROP_NOTHING } = {}) {
@@ -121,7 +108,7 @@ function quotaSegment(rateLimits, { now, seat, drop = DROP_NOTHING } = {}) {
   for (const [label, key] of [['5h', 'five_hour'], ['7d', 'seven_day']]) {
     const quota = windows[key];
     if (!quota || quota.used_percentage == null) continue;
-    // These arrive as floats (55.00000000000001) — never print them raw.
+    // These arrive as floats (55.00000000000001), so never print them raw.
     const pct = Math.round(quota.used_percentage);
     const left = drop.has('expiry') ? null : expiresIn(quota.resets_at, now);
     const expiry = left ? dim(` exp ${left}`) : '';
@@ -131,11 +118,22 @@ function quotaSegment(rateLimits, { now, seat, drop = DROP_NOTHING } = {}) {
   return parts.length ? parts.join(dim(' · ')) : null;
 }
 
+// The model, and the window size it is really running with. Claude Code already
+// spells the cap into the display name for some models ("Sonnet 5 (1M context)")
+// and not others, so that suffix is stripped and the cap restated from
+// context_window_size, which is the same number the percentage bar is built on.
+function modelSegment(data, { drop = DROP_NOTHING } = {}) {
+  const name = (data.model?.display_name || 'Claude').replace(/\s*\([^()]*context\)\s*$/i, '');
+  const declared = data.context_window?.context_window_size || data.context_window?.total_tokens;
+  const cap = drop.has('cap') || !declared ? '' : ` (${compact(declared)})`;
+  return dim(`${name}${cap}`);
+}
+
 const directoryName = (data) => path.basename(data.workspace?.current_dir || process.cwd());
 
 function render(data, { now, seat, env = process.env, drop = DROP_NOTHING } = {}) {
   const segments = [
-    drop.has('model') ? null : dim(data.model?.display_name || 'Claude'),
+    drop.has('model') ? null : modelSegment(data, { drop }),
     drop.has('directory') ? null : dim(directoryName(data)),
     contextSegment(data.context_window || {}, { env, drop }),
     drop.has('cost') ? null : costSegment(data.cost?.total_cost_usd),
@@ -145,7 +143,8 @@ function render(data, { now, seat, env = process.env, drop = DROP_NOTHING } = {}
 }
 
 // Claude Code passes the pane's width in COLUMNS. Without it, nothing is given
-// up — an unknown width is not an excuse to render less than was asked for.
+// up, because an unknown width is not an excuse to render less than was asked
+// for.
 function fit(data, options = {}) {
   const env = options.env || process.env;
   const columns = Number.parseInt(env.COLUMNS || '0', 10) || 0;
@@ -173,7 +172,7 @@ function seatName(env = process.env) {
     const email = config.oauthAccount?.emailAddress;
     if (email) return email.split('@')[0];
   } catch {
-    // Missing, unreadable, or half-written mid-save — the directory name will do.
+    // Missing, unreadable, or half-written mid-save, so the directory name will do.
   }
 
   const seatDir = configDir && path.basename(configDir).match(/^\.claude-seat-(.+)$/);
@@ -183,7 +182,7 @@ function seatName(env = process.env) {
 }
 
 // A status line that fails is worth less than no status line at all, so every
-// failure here — bad JSON, a payload shaped differently, a slow pipe — exits
+// failure here (bad JSON, a payload shaped differently, a slow pipe) exits
 // quietly and leaves Claude Code's own default in place.
 function main() {
   let input = '';
@@ -202,7 +201,7 @@ function main() {
 }
 
 module.exports = {
-  compact, contextSegment, costSegment, expiresIn, fit, heldTokens,
+  compact, contextSegment, costSegment, expiresIn, fit, modelSegment,
   quotaSegment, ramp, render, seatName, width, TRIMS,
 };
 

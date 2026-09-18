@@ -10,7 +10,7 @@ const path = require('node:path');
 const { test } = require('node:test');
 
 const {
-  compact, contextSegment, costSegment, expiresIn, fit, heldTokens,
+  compact, contextSegment, costSegment, expiresIn, fit, modelSegment,
   quotaSegment, ramp, render, seatName, width, TRIMS,
 } = require('./claude-statusline.js');
 
@@ -47,11 +47,39 @@ test('compact keeps the token count to a glance', () => {
   assert.equal(compact(12_000_000), '12M');
 });
 
-test('heldTokens prefers the stated total, then sums the parts', () => {
-  assert.equal(heldTokens({ total_input_tokens: 1234 }), 1234);
-  assert.equal(heldTokens({ total_input_tokens: 0 }), 0, 'zero is a total, not a miss');
-  assert.equal(heldTokens({}), null);
-  assert.equal(heldTokens({ current_usage: { input_tokens: 1000, cache_read_input_tokens: 50_000 } }), 51_000);
+test('modelSegment states the cap the session actually has', () => {
+  const at = (display_name, context_window_size) => plain(modelSegment({
+    model: { display_name },
+    context_window: context_window_size ? { context_window_size } : {},
+  }));
+  assert.equal(at('Opus 5', 1_000_000), 'Opus 5 (1M)');
+  assert.equal(at('Sonnet 5', 200_000), 'Sonnet 5 (200k)', 'the 200k build must not claim 1M');
+  assert.equal(at('Haiku 4.5', 200_000), 'Haiku 4.5 (200k)');
+  assert.equal(at('Custom', 500_000), 'Custom (500k)', 'any size, not a fixed pair');
+});
+
+test('modelSegment does not say the cap twice', () => {
+  // Claude Code spells the cap into the display name for the 1M variants only.
+  const at = (display_name, context_window_size) => plain(modelSegment({
+    model: { display_name }, context_window: { context_window_size },
+  }));
+  assert.equal(at('Sonnet 5 (1M context)', 1_000_000), 'Sonnet 5 (1M)');
+  assert.equal(at('Opus 4.8 (1M context)', 1_000_000), 'Opus 4.8 (1M)');
+  assert.equal(at('Opus (1M context)', 1_000_000), 'Opus (1M)');
+});
+
+test('modelSegment invents nothing when the size is unknown', () => {
+  assert.equal(plain(modelSegment({ model: { display_name: 'Sonnet 5' }, context_window: {} })), 'Sonnet 5',
+    'no declared size means no cap, never a guessed one');
+  assert.equal(plain(modelSegment({})), 'Claude');
+  assert.equal(plain(modelSegment({ model: { display_name: 'Opus 5' } })), 'Opus 5');
+});
+
+test('the cap is the first thing a narrow pane gives up', () => {
+  assert.equal(plain(modelSegment(
+    { model: { display_name: 'Opus 5' }, context_window: { context_window_size: 1_000_000 } },
+    { drop: new Set(['cap']) },
+  )), 'Opus 5');
 });
 
 test('ramp escalates, and only the context bar flashes', () => {
@@ -88,8 +116,8 @@ test('contextSegment rescales onto the usable window and clamps', () => {
   const at = (remaining, extra = {}) => plain(contextSegment(
     { remaining_percentage: remaining, context_window_size: 1_000_000, ...extra }, { env: {} },
   ));
-  assert.equal(at(100, { total_input_tokens: 0 }), '░░░░░░░░░░ 0% 0/1M');
-  assert.equal(at(16.5, { total_input_tokens: 1_000_000 }), '██████████ 100% 1M/1M',
+  assert.equal(at(100, { total_input_tokens: 0 }), '░░░░░░░░░░ 0%');
+  assert.equal(at(16.5, { total_input_tokens: 1_000_000 }), '██████████ 100%',
     'the reserved slice is the floor, not zero');
   assert.equal(at(0), '██████████ 100%', 'past the reserve still reads full, never over');
   assert.equal(contextSegment({}, { env: {} }), null, 'no percentage, no bar');
@@ -97,9 +125,9 @@ test('contextSegment rescales onto the usable window and clamps', () => {
 
 test('contextSegment honours CLAUDE_CODE_AUTO_COMPACT_WINDOW', () => {
   const cw = { remaining_percentage: 45, context_window_size: 1_000_000, total_input_tokens: 420_000 };
-  assert.equal(plain(contextSegment(cw, { env: {} })), '██████░░░░ 66% 420k/1M');
+  assert.equal(plain(contextSegment(cw, { env: {} })), '██████░░░░ 66%');
   assert.equal(plain(contextSegment(cw, { env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '300000' } })),
-    '██████████ 100% 420k/1M', 'a smaller compact window means less usable room');
+    '██████████ 100%', 'a smaller compact window means less usable room');
 });
 
 test('costSegment only prints a real number', () => {
@@ -117,7 +145,7 @@ test('render lays the segments out in order and drops the empty ones', () => {
     cost: { total_cost_usd: 3.63 },
     rate_limits: { five_hour: { used_percentage: 28, resets_at: NOW + 3 * 3600 } },
   }, { now: NOW, seat: 'sam', env: {} }));
-  assert.equal(line, 'Opus 5 │ my-project │ ██████░░░░ 66% 420k/1M │ $3.63 │ sam · 5h 28% exp 3h');
+  assert.equal(line, 'Opus 5 (1M) │ my-project │ ██████░░░░ 66% │ $3.63 │ sam · 5h 28% exp 3h');
 });
 
 test('render survives a payload with nothing in it', () => {
@@ -173,13 +201,14 @@ test('width ignores colour', () => {
 
 test('fit gives nothing up when there is room', () => {
   assert.equal(fitted(200),
-    'Opus 5 │ my-project │ ██████░░░░ 66% 420k/1M │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
+    'Opus 5 (1M) │ my-project │ ██████░░░░ 66% │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
 });
 
 test('fit gives up detail in order, least useful first', () => {
-  assert.equal(fitted(90), 'Opus 5 │ my-project │ ██████░░░░ 66% 420k/1M │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d',
+  assert.equal(fitted(87), 'Opus 5 (1M) │ my-project │ ██████░░░░ 66% │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d',
     'exactly the full width still fits');
-  assert.equal(fitted(89), 'Opus 5 │ my-project │ ██████░░░░ 66% │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
+  assert.equal(fitted(86), 'Opus 5 │ my-project │ ██████░░░░ 66% │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d',
+    'the cap is the first thing to go');
   assert.equal(fitted(81), 'Opus 5 │ my-project │ 66% │ $3.63 │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
   assert.equal(fitted(70), 'Opus 5 │ my-project │ 66% │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
   assert.equal(fitted(62), 'Opus 5 │ 66% │ sam · 5h 28% exp 2h · 7d 59% exp 2d');
@@ -215,7 +244,7 @@ test('every trim name is one a segment actually honours', () => {
   assert.equal(stripped, '66% │ sam · 5h 28% · 7d 59%');
   for (const trim of TRIMS) {
     const one = plain(render(WIDE, { now: NOW, seat: 'sam', env: {}, drop: new Set([trim]) }));
-    assert.notEqual(one, fitted(200), `dropping "${trim}" changed nothing — is it wired up?`);
+    assert.notEqual(one, fitted(200), `dropping "${trim}" changed nothing. Is it wired up?`);
   }
 });
 
@@ -241,7 +270,7 @@ function spread() {
   return out;
 }
 
-test('colour is always closed — nothing bleeds into the next line', () => {
+test('colour is always closed, so nothing bleeds into the next line', () => {
   for (const data of spread()) {
     for (const columns of [200, 90, 70, 50, 30]) {
       const line = fit(data, { now: NOW, seat: 'sam', env: { COLUMNS: String(columns) } });
